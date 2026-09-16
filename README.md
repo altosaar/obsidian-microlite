@@ -39,8 +39,8 @@ opened but did not change.
 Microlite runs entirely on your device and makes **no network requests**. It reads File Recovery
 snapshots and your notes' current content, and it writes one review note. It lists your Markdown
 files for a single purpose — detecting renames — and matches a renamed note's snapshots to its
-current file by content, reading a file only when its size matches a snapshot. Nothing leaves your
-vault.
+current file by content, reading a file only when its size is close enough to a snapshot's to be
+that note, or when it already has snapshots of its own. Nothing leaves your vault.
 
 By default it also adds its output folder to Obsidian's **Excluded files** list (Settings → Files
 and links) so the generated review notes stay out of Search, Quick switcher, Graph, and backlinks.

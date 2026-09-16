@@ -3,12 +3,15 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+	couldBeRenameBySize,
 	groupByPath,
+	renameThreshold,
 	isOwnOutput,
 	mergeCurrentContent,
 	renderPromptTemplate,
 	renderReview,
 	resolveRenames,
+	similarity,
 } from '../src/review';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -194,8 +197,7 @@ describe('resolveRenames', () => {
 			{ path: 'relationship-notes_.md.md', ts: 2, data: '# R\n\nbody edited\n' },
 		]);
 		const deleted = new Set(['relationship-notes_.md.md']);
-		const live = new Map([['# R\n\nbody edited', 'relationship-notes_.md']]);
-		resolveRenames(byPath, deleted, (content) => live.get(content.trim()) ?? null);
+		resolveRenames(byPath, deleted, [{ path: 'relationship-notes_.md', data: '# R\n\nbody edited\n' }]);
 		expect(deleted.has('relationship-notes_.md.md')).toBe(false);
 		expect(byPath.has('relationship-notes_.md.md')).toBe(false);
 		expect(byPath.get('relationship-notes_.md')!.map((s) => s.ts)).toEqual([1, 2]);
@@ -207,7 +209,7 @@ describe('resolveRenames', () => {
 			{ path: 'new.md', ts: 3, data: 'c' },
 		]);
 		const deleted = new Set(['old.md']);
-		resolveRenames(byPath, deleted, () => 'new.md');
+		resolveRenames(byPath, deleted, [{ path: 'new.md', data: 'a' }]);
 		expect(byPath.get('new.md')!.map((s) => s.ts)).toEqual([1, 3]);
 		expect(byPath.has('old.md')).toBe(false);
 	});
@@ -215,9 +217,127 @@ describe('resolveRenames', () => {
 	it('leaves genuinely-deleted notes when no live file matches', () => {
 		const byPath = groupByPath([{ path: 'gone.md', ts: 1, data: 'x' }]);
 		const deleted = new Set(['gone.md']);
-		resolveRenames(byPath, deleted, () => null);
+		resolveRenames(byPath, deleted, [{ path: 'other.md', data: 'totally different' }]);
 		expect(deleted.has('gone.md')).toBe(true);
 		expect(byPath.has('gone.md')).toBe(true);
+	});
+
+	it('matches a note renamed *and* lightly edited since its last snapshot', () => {
+		const body = Array.from({ length: 200 }, (_, i) => `line ${i}`).join('\n');
+		const byPath = groupByPath([{ path: 'old name.md', ts: 1, data: `# Note\n\n${body}\n` }]);
+		const deleted = new Set(['old name.md']);
+		// One line appended after the rename: ~99.5% similar, well inside the 98% bar.
+		resolveRenames(byPath, deleted, [{ path: 'new name.md', data: `# Note\n\n${body}\nline 200\n` }]);
+		expect(deleted.size).toBe(0);
+		expect(byPath.get('new name.md')!.map((s) => s.ts)).toEqual([1]);
+	});
+
+	it('gives a short note real slack: a one-line edit is still the same note', () => {
+		// ~1 KB. A flat 98% bar allows 20 characters of drift here; the absolute slack allows ~120.
+		const body = Array.from({ length: 120 }, (_, i) => `line ${i}`).join('\n');
+		const byPath = groupByPath([{ path: 'old.md', ts: 1, data: `# Project\n\n${body}\n` }]);
+		const deleted = new Set(['old.md']);
+		resolveRenames(byPath, deleted, [{ path: 'new.md', data: `# Project\n\n${body}\n\n## Next steps\n\nship it\n` }]);
+		expect(deleted.size).toBe(0);
+		expect(byPath.get('new.md')!.map((s) => s.ts)).toEqual([1]);
+	});
+
+	it('still refuses a tiny note that the slack alone would have swallowed', () => {
+		// Two short notes sharing only their heading: the slack would cover the whole rewrite, the
+		// floor does not.
+		const byPath = groupByPath([{ path: 'gone.md', ts: 1, data: '# Meeting\n\nalpha\nbeta\ngamma\n' }]);
+		const deleted = new Set(['gone.md']);
+		resolveRenames(byPath, deleted, [{ path: 'other.md', data: '# Meeting\n\ndelta\nepsilon\nzeta\n' }]);
+		expect(deleted.has('gone.md')).toBe(true);
+	});
+
+	it('matches via the new name\'s earliest snapshot when the live file has since been rewritten', () => {
+		const body = Array.from({ length: 400 }, (_, i) => `line ${i}`).join('\n');
+		const byPath = groupByPath([
+			{ path: 'old.md', ts: 1, data: `${body}\n` },
+			// File Recovery caught the file just after the rename, then it was rewritten wholesale.
+			{ path: 'new.md', ts: 2, data: `${body}\n` },
+		]);
+		const deleted = new Set(['old.md']);
+		resolveRenames(byPath, deleted, [{ path: 'new.md', data: 'a completely different note now\n' }]);
+		expect(deleted.size).toBe(0);
+		expect(byPath.get('new.md')!.map((s) => s.ts)).toEqual([1, 2]);
+	});
+
+	it('does not match a live note that merely looks similar', () => {
+		const byPath = groupByPath([{ path: 'gone.md', ts: 1, data: '# Meeting\n\nalpha\nbeta\ngamma\n' }]);
+		const deleted = new Set(['gone.md']);
+		resolveRenames(byPath, deleted, [{ path: 'template.md', data: '# Meeting\n\ndelta\nepsilon\nzeta\n' }]);
+		expect(deleted.has('gone.md')).toBe(true);
+		expect(byPath.has('template.md')).toBe(false);
+	});
+
+	it('pairs each live file with at most one missing note, best match first', () => {
+		const body = Array.from({ length: 200 }, (_, i) => `line ${i}`).join('\n');
+		const byPath = groupByPath([
+			{ path: 'a.md', ts: 1, data: `${body}\n` },
+			{ path: 'b.md', ts: 2, data: `${body}\nextra\n` },
+		]);
+		const deleted = new Set(['a.md', 'b.md']);
+		// a.md is the exact content of live.md, so it wins it; b.md has nowhere else to go.
+		resolveRenames(byPath, deleted, [{ path: 'live.md', data: `${body}\n` }]);
+		expect(byPath.get('live.md')!.map((s) => s.ts)).toEqual([1]);
+		expect(deleted.has('b.md')).toBe(true);
+	});
+});
+
+describe('similarity', () => {
+	it('scores identical text 1 and disjoint text 0', () => {
+		expect(similarity('a\nb\n', 'a\nb\n')).toBe(1);
+		expect(similarity('a\nb\n', 'c\nd\n')).toBe(0);
+	});
+
+	it('scores an insertion by the share of the larger text that is shared', () => {
+		// 100 identical lines, then one more added: the score is ~100/101 of the larger side.
+		const lines = Array.from({ length: 100 }, (_, i) => `line ${i}`);
+		const a = `${lines.join('\n')}\n`;
+		const b = `${a}line 100\n`;
+		expect(similarity(a, b)).toBeGreaterThan(0.98);
+		expect(similarity(a, b)).toBeLessThan(1);
+		expect(similarity(a, b)).toBe(similarity(b, a));
+	});
+
+	it('ignores line order, so a moved paragraph is not a new note', () => {
+		expect(similarity('a\nb\nc\n', 'c\nb\na\n')).toBe(1);
+	});
+});
+
+describe('renameThreshold', () => {
+	it('holds at the relative bar for notes big enough for it to bite', () => {
+		expect(renameThreshold(50_000)).toBeCloseTo(0.98, 10);
+		expect(renameThreshold(6000)).toBeCloseTo(0.98, 10);
+	});
+
+	it('relaxes for short notes, but never past the floor', () => {
+		expect(renameThreshold(1000)).toBeCloseTo(0.88, 10); // 120 chars of slack, not 20
+		expect(renameThreshold(200)).toBe(0.8);
+		expect(renameThreshold(10)).toBe(0.8);
+		expect(renameThreshold(0)).toBe(0.98);
+	});
+
+	it('never gets stricter as a note grows', () => {
+		let previous = 0;
+		for (const size of [10, 100, 500, 1000, 5000, 20_000, 100_000]) {
+			const t = renameThreshold(size);
+			expect(t).toBeGreaterThanOrEqual(previous);
+			previous = t;
+		}
+	});
+});
+
+describe('couldBeRenameBySize', () => {
+	it('keeps only sizes that could still clear the bar', () => {
+		expect(couldBeRenameBySize(50_000, 50_000)).toBe(true);
+		expect(couldBeRenameBySize(50_000, 49_500)).toBe(true);
+		expect(couldBeRenameBySize(50_000, 45_000)).toBe(false);
+		expect(couldBeRenameBySize(1000, 900)).toBe(true); // within the short-note slack
+		expect(couldBeRenameBySize(1000, 700)).toBe(false);
+		expect(couldBeRenameBySize(0, 0)).toBe(true);
 	});
 });
 

@@ -397,29 +397,165 @@ export function isOwnOutput(path: string, outputFolder: string): boolean {
 }
 
 /**
+ * How similar a missing note's last snapshot must be to a live file before we call it the same
+ * note under a new name. Git's default is 50%; we want far less room for a false positive here
+ * (a template, or a note duplicated and then edited), so a rename has to be near-verbatim.
+ */
+export const RENAME_MIN_SIMILARITY = 0.98;
+
+/**
+ * The absolute half of the tolerance, in characters. A pure ratio has no slack left on a short
+ * note — 2% of a 600-character note is twelve characters, so fixing one sentence after renaming it
+ * would read as a different note — which is the usual reason a relative tolerance is paired with an
+ * absolute one (`rel_tol` + `abs_tol` in Python's `math.isclose`, `rtol` + `atol` in NumPy). This is
+ * the floor on how much drift a note of *any* size is allowed: roughly a line or two.
+ */
+export const RENAME_SLACK_CHARS = 120;
+
+/**
+ * ...and the clamp that keeps the absolute slack from swallowing a tiny note whole. On a
+ * 200-character note the slack alone would permit a 60% rewrite, so no note, however short, is ever
+ * matched below this score. (Still well above git's 50% default.)
+ */
+export const RENAME_MIN_SIMILARITY_FLOOR = 0.8;
+
+/**
+ * The score a pair of texts whose larger side is `size` characters must actually reach: the looser
+ * of the relative and absolute tolerances, clamped at the floor. Constant at `minScore` for notes
+ * big enough that 2% exceeds the slack (~6 KB and up), relaxing smoothly to the floor for short
+ * ones, so a one-line edit costs a short note roughly what it costs a long one.
+ */
+export function renameThreshold(size: number, minScore: number = RENAME_MIN_SIMILARITY): number {
+	if (size <= 0) return minScore;
+	const allowedDrift = Math.max(RENAME_SLACK_CHARS, (1 - minScore) * size);
+	return Math.max(RENAME_MIN_SIMILARITY_FLOOR, 1 - allowedDrift / size);
+}
+
+/**
+ * Git's similarity score, in [0, 1]: the share of the *larger* text that both texts have in
+ * common, counted over whole lines. Mirrors `estimate_similarity` in git's diffcore-rename.c —
+ * `copied / max(src, dst)` — so identical texts score 1, and inserting n characters into an
+ * m-character note scores m / (m + n). Lines are matched as a multiset, so moving a paragraph
+ * costs nothing and duplicating one is only counted once.
+ */
+export function similarity(a: string, b: string): number {
+	if (a === b) return 1;
+	const max = Math.max(a.length, b.length);
+	if (max === 0) return 1;
+	const pool = new Map<string, number>();
+	for (const line of splitlines(a)) pool.set(line, (pool.get(line) ?? 0) + 1);
+	let common = 0;
+	for (const line of splitlines(b)) {
+		const left = pool.get(line) ?? 0;
+		if (left === 0) continue;
+		pool.set(line, left - 1);
+		common += line.length + 1; // the line, plus the newline that followed it
+	}
+	return Math.min(common, max) / max;
+}
+
+/**
+ * Git's cheap pre-filter (same file): two texts whose lengths differ by more than the score allows
+ * can never reach it, since the score is at most `min / max`. Lets the caller skip reading a file.
+ */
+export function couldBeRenameBySize(a: number, b: number, minScore: number = RENAME_MIN_SIMILARITY): boolean {
+	const max = Math.max(a, b);
+	return max === 0 ? true : Math.min(a, b) / max >= renameThreshold(max, minScore);
+}
+
+/** A live vault file offered as a possible rename target, with its current content. */
+export interface RenameCandidate {
+	path: string;
+	data: string;
+}
+
+/**
  * Link snapshots whose original path no longer exists to the live file that now holds their
  * content — i.e. detect renames. File Recovery keys snapshots by path and does not migrate them on
  * rename, so a created-then-renamed note's history sits under the old path (often with quirks like
- * a doubled `.md.md` extension) while the current file has no snapshots under its new name.
+ * a doubled `.md.md` extension) while the current file has little or no history under its new name.
  *
- * For each missing path, `findCurrentPath(newestContent)` returns the live path whose content
- * matches, or null. Matched snapshots are re-keyed onto that path (merged with any it already has,
- * sorted by ts) and removed from `deletedPaths`; unmatched paths stay deleted.
+ * Matching follows git's rename detection: an exact-content pass first, then a similarity pass that
+ * pairs each still-missing path with its best-scoring candidate at or above `renameThreshold`.
+ * Pairing is one-to-one — a live file can only be the new name of one missing note — and ties go to
+ * the lexicographically first path so the output is deterministic. Content is compared after
+ * `normalizeForCompare`, so a rename that only rewrote line endings still counts as exact.
+ *
+ * A candidate is compared on two texts: its live content, and its *earliest* snapshot under the new
+ * name, if File Recovery captured one. The earliest new-name snapshot is usually taken moments after
+ * the rename, so it still looks like the old path's last snapshot no matter how much was written
+ * afterwards — which is what lets a note that was renamed and then heavily rewritten still be
+ * recognized, since the live content alone would have drifted far out of range.
+ *
+ * Matched snapshots are re-keyed onto that path (merged with any it already has, sorted by ts) and
+ * removed from `deletedPaths`; unmatched paths stay deleted.
  */
 export function resolveRenames(
 	byPath: SnapshotsByPath,
 	deletedPaths: Set<string>,
-	findCurrentPath: (content: string) => string | null,
+	candidates: Iterable<RenameCandidate>,
+	minScore: number = RENAME_MIN_SIMILARITY,
 ): void {
-	for (const oldPath of [...deletedPaths]) {
+	const missing: Array<{ path: string; data: string }> = [];
+	for (const oldPath of deletedPaths) {
 		const versions = byPath.get(oldPath);
 		if (!versions || versions.length === 0) continue;
-		const target = findCurrentPath(versions[versions.length - 1]!.data);
-		if (!target || target === oldPath) continue;
+		missing.push({ path: oldPath, data: normalizeForCompare(versions[versions.length - 1]!.data) });
+	}
+	if (missing.length === 0) return;
+
+	// Each candidate's comparable faces: what it holds now, and what it held when it first appeared.
+	const pool = [...candidates].map((c) => {
+		const live = normalizeForCompare(c.data);
+		const own = byPath.get(c.path);
+		const first = own && own.length > 0 ? normalizeForCompare(own[0]!.data) : live;
+		return { path: c.path, texts: first === live ? [live] : [live, first] };
+	});
+
+	const rekey = (oldPath: string, target: string): void => {
+		const versions = byPath.get(oldPath)!;
 		const existing = byPath.get(target) ?? [];
 		byPath.set(target, [...existing, ...versions].sort((a, b) => a.ts - b.ts));
 		byPath.delete(oldPath);
 		deletedPaths.delete(oldPath);
+	};
+	const claimed = new Set<string>();
+
+	// Pass 1: the note is unchanged since some snapshot of it — renamed and not written to since,
+	// or renamed, snapshotted, and rewritten only after that.
+	const unmatched: typeof missing = [];
+	for (const src of missing) {
+		const hit = pool.find((c) => !claimed.has(c.path) && c.path !== src.path && c.texts.includes(src.data));
+		if (!hit) {
+			unmatched.push(src);
+			continue;
+		}
+		claimed.add(hit.path);
+		rekey(src.path, hit.path);
+	}
+
+	// Pass 2: the note was renamed *and* edited, so only near-identical content gives it away.
+	const score = (a: string, b: string): number => {
+		const max = Math.max(a.length, b.length);
+		if (!couldBeRenameBySize(a.length, b.length, minScore)) return 0;
+		const s = similarity(a, b);
+		return s >= renameThreshold(max, minScore) ? s : 0;
+	};
+	for (const src of unmatched) {
+		let bestPath: string | null = null;
+		let bestScore = 0;
+		for (const c of pool) {
+			if (claimed.has(c.path) || c.path === src.path) continue;
+			const s = Math.max(...c.texts.map((t) => score(src.data, t)));
+			if (s === 0) continue;
+			if (s > bestScore || (s === bestScore && bestPath !== null && c.path < bestPath)) {
+				bestScore = s;
+				bestPath = c.path;
+			}
+		}
+		if (!bestPath) continue;
+		claimed.add(bestPath);
+		rekey(src.path, bestPath);
 	}
 }
 

@@ -8,13 +8,14 @@ import { MICROLITE_ICON_ID, MICROLITE_ICON_SVG } from './icon';
 import { GERUNDS, gerundAt } from './gerunds';
 import { readSnapshots } from './recovery';
 import {
+	couldBeRenameBySize,
 	groupByPath,
 	isOwnOutput,
 	mergeCurrentContent,
-	normalizeForCompare,
 	renderPromptTemplate,
 	renderReview,
 	resolveRenames,
+	type RenameCandidate,
 	type SnapshotsByPath,
 } from './review';
 
@@ -198,23 +199,29 @@ export default class MicroliteHunksPlugin extends Plugin {
 		}
 	}
 
-	/** Detect renames: re-key missing paths' snapshots onto the live file that holds their content.
-	 *  Reads only live files whose byte size matches a missing note's newest snapshot, to bound work
-	 *  (and avoid materializing every iCloud file). */
+	/** Detect renames: re-key missing paths' snapshots onto the live file that now holds their note.
+	 *  A file is worth reading if its byte size is close enough to a missing note's newest snapshot
+	 *  to possibly clear the similarity bar, or if it has snapshot history of its own — that history
+	 *  lets `resolveRenames` compare against what the file looked like just after the rename rather
+	 *  than only against its current, possibly much-rewritten content. Everything else is skipped, so
+	 *  a generate never materializes every file in an iCloud vault; the files with history are read
+	 *  by the `currents` pass moments later anyway, and `cachedRead` serves both from one read. */
 	private async resolveRenamesByContent(byPath: SnapshotsByPath, deletedPaths: Set<string>): Promise<void> {
 		if (deletedPaths.size === 0) return;
 		const enc = new TextEncoder();
-		const wantedSizes = new Set<number>();
+		const wantedSizes: number[] = [];
 		for (const p of deletedPaths) {
 			const vs = byPath.get(p);
-			if (vs && vs.length > 0) wantedSizes.add(enc.encode(vs[vs.length - 1]!.data).length);
+			if (vs && vs.length > 0) wantedSizes.push(enc.encode(vs[vs.length - 1]!.data).length);
 		}
-		const byContent = new Map<string, string>();
+		const candidates: RenameCandidate[] = [];
 		for (const f of this.app.vault.getMarkdownFiles()) {
-			if (!wantedSizes.has(f.stat.size)) continue;
-			byContent.set(normalizeForCompare(await this.app.vault.cachedRead(f)), f.path);
+			const worthReading =
+				byPath.has(f.path) || wantedSizes.some((size) => couldBeRenameBySize(size, f.stat.size));
+			if (!worthReading) continue;
+			candidates.push({ path: f.path, data: await this.app.vault.cachedRead(f) });
 		}
-		resolveRenames(byPath, deletedPaths, (content) => byContent.get(normalizeForCompare(content)) ?? null);
+		resolveRenames(byPath, deletedPaths, candidates);
 	}
 
 	/**
