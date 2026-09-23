@@ -113,19 +113,10 @@ No vault-derived data is ever committed. Committed test fixtures are entirely sy
 test (`test/no-private-data.test.ts`) fails CI if anything else slips in. Real-vault output stays
 gitignored.
 
-## Community catalog descriptions
-
-Canonical copy for the [community.obsidian.md](https://obsidian.md/plugins) listing.
-
-**Short description (community website)** — 152 / 200 characters:
-
-> Turn a week of edits across all your notes into one LLM-ready review — like "track changes" for
-> your whole vault, ready to paste into Claude or ChatGPT.
-
 ## License
 
 MIT
 
 ## Contact
 
-Questions, issues, or feedback: [jaan.li@jaan.li](mailto:jaan.li@jaan.li)
+Questions, issues, or feedback: [j@jaan.io](mailto:j@jaan.io)
