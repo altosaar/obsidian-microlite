@@ -3,6 +3,8 @@
 Turn Obsidian's **File Recovery** history into an LLM-ready review of what you've actually been
 writing — one tap, one note, ready to paste into a chat for interrogation.
 
+Accompanying blog post showing how to use this to get a 15-20 minute podcast based on your Obsidian vault: https://jaan.io/lifelogging-with-large-language-models
+
 <img width="661" height="500" alt="image" src="https://github.com/user-attachments/assets/0f9a6e05-13c9-499d-8b0a-dfa58b42f707" />
 
 ## The idea
