@@ -3,6 +3,8 @@
 Turn Obsidian's **File Recovery** history into an LLM-ready review of what you've actually been
 writing — one tap, one note, ready to paste into a chat for interrogation.
 
+<img width="1322" height="1000" alt="image" src="https://github.com/user-attachments/assets/0f9a6e05-13c9-499d-8b0a-dfa58b42f707" />
+
 ## The idea
 
 Obsidian can contain fluidal structure, with crystals called _microlites_ suspended in the flow of
