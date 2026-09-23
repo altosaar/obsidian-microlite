@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-microlite",
-	"version": "0.8.0",
+	"version": "0.8.1",
 	"description": "Turn Obsidian File Recovery history into an LLM-ready weekly review.",
 	"main": "main.js",
 	"type": "module",
